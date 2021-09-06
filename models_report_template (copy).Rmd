@@ -1,0 +1,528 @@
+---
+title: "SOM report of `r wp_code` park fault `r fault`"
+author: "Smartive:ABM"
+date: "`r format(Sys.time(), '%Y/%m/%d')`"
+output:
+  html_document:
+    pandoc_args: [
+      "+RTS", "-K2048m",
+      "-RTS"
+    ]
+---
+
+```{r imports,echo=FALSE, message=FALSE,warning=FALSE, eval=TRUE,results='asis'}
+#Dependencia basica
+if(!exists("dependencyLoader")){
+  if( !file.exists(paste0(parent_directory,'/sources_common/dependencyLoader.R')) ) 
+    return(list(error=TRUE,data=NULL,
+                msg=paste0("\n",iam,": Missing dependency function: sources_common/dependencyLoader.R")));
+  source( paste0(parent_directory,'/sources_common/dependencyLoader.R') )
+}
+
+# Sources
+libraries<-c('plyr','dplyr','plotly','RMySQL','dynamicTreeCut', 'rmarkdown','ggplot2','htmlwidgets','reshape2','xtable','grDevices','stringr','knitr')
+sources_common<-paste0(parent_directory,"/functions_common/", c('filter_plot.R','get_file_path.R','db_query.R','close_protocol.R','db_get_event_description.R','formatter_get_tableinfo.R'))
+sources_som<-paste0(parent_directory,"/functions_som/",c('plot_bmu_turbines.R','plot_histogram_som_clusters.R','plot_umatrix.R','plot_heatmap_variable.R','plot_distance_bmu.R','create_umatrix.R','create_bmu_clustering.R','calcule_distance_matrix_turbines.R','create_turbines_groups.R','plot_som_codes_importance.R','plot_neuron_change.R'))
+
+dep<-dependencyLoader(c(libraries,sources_common,sources_som))
+if(dep$error){
+  output_msg <- paste0("\n Report rmd: on call dependencyLoader\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+rm(dep)
+
+## Folder with data images of the models.
+folder <- paste0(parent_directory,"/images")
+```
+
+```{r prepare_data,echo=FALSE, message=FALSE,warning=FALSE,results = 'hide'}
+#Prepare data
+time_mark<-str_extract(basename(wt_query$path[1]),"[:digit:]{4}-([:digit:]{2}-{0,1}){4}")#yyyy-mm-dd-hh-mm
+
+## 1. Load trained models
+con <- xzfile(wt_query$path[1])
+load <- try( load(con) )
+if( inherits(load, "try-error") ) {
+  cat("\n\n",iam,":on loading model from: ",wt_query$path,"\n\t", load,"\n\n")
+  next()
+}
+if(!exists("results") || length(results) == 0 ) {
+  cat("\n\n",iam,":on load model: empty results\n\n")
+  next()
+}
+if( length(results) > 1 )
+  cat("\nresults object contains more than one model set. Only first element will be processed\n")
+
+n_wt_fault <- length(results)
+WT_fault<-names(results)[n_wt_fault]
+n_horizons <- length(results[[1]])
+horizon<-names(results[[WT_fault]])
+umatrix_plots<-list()
+umatrix_with_clusters<-list()
+heatmap_variable_plots_mean<-list()
+heatmap_variable_plots_sdv<-list()
+
+for(h in horizon){
+  model<-results[[WT_fault]][[h]]$model
+  model_params<-results[[WT_fault]][[h]]$model_params
+  stat<-results[[WT_fault]][[h]]$stat
+  metrics<-results[[WT_fault]][[h]]$metrics
+  
+  # Loading necessary data for current machine from saved wsp image
+  rs <-  get_file_path(folder, WT_fault, h, time_mark) 
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: File for id:",id,"no found. Report aborted.\n")
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  zipFileName<-rs$data$zipFileName
+  fileName<-rs$data$fileBaseName
+  temp_env <- new.env()
+  #load(file, envir = temp_env)
+  #load(file =unz(zipFileName,fileName),envir = temp_env)
+  con2 <- unz(zipFileName,fileName)
+  load <- try( load(con2, envir = temp_env) )
+  
+  if( inherits(load, "try-error") ) {
+    cat("\n\n Unable to load",zipFileName," from: ", folder,"\n")
+    next()
+  }
+  
+  #TrainData
+  to_recover<-c('som_center_neuron_position','som_pts','som_codes','wtdata_bmu','dim','trainData','som_selected_rows','som_selected_columns','som_distances','alarm','alarm_block_code','alarm_all','alarm_all_block_code','ot','ot_all','ot_block_code','ot_all_block_code','date_time_name','filter_range_data','freq_dat_med_min')
+  for(re in to_recover){
+    if(re %in% names(temp_env))
+      assign(re,get(re,envir = temp_env)) #recover re variable with its name for futures analysis
+    else
+      assign(re,NA) #Not found fill with na
+  }
+  close(con2)
+  # Clean memory 
+  rm(temp_env)
+  invisible(gc(verbose=F))
+  
+  array_id_walm<-wt_query$array_id_walm[1]
+  array_ot<-wt_query$array_ot[1]
+  wp_code<-wt_query$wp_code[1]
+  wp_id<-wt_query$wp_id[1]
+  db_config<-db_config_data
+  #End train data
+  
+  #Umatrix
+  sc_dists<-dist(som_codes)
+  clusters<-hclust(sc_dists)
+  colnames(som_codes)<-som_selected_columns
+  #Idendro
+  #install.packages("idendr0")
+  #idendr0
+  #idendr0::idendro(clusters,som_codes)
+  #som_cluster <- cutree(clusters, 5)
+  som_cluster<-cutreeDynamic(clusters, method = "hybrid", distM=as.matrix(sc_dists),deepSplit = FALSE,verbose=F,minClusterSize=floor(dim(som_codes)[1]*0.05))
+  rm(list=c('clusters','sc_dists'))
+  invisible(gc(verbose=F))
+  
+  ##### Umatrix ####
+  rs<-create_umatrix(som_pts=som_pts,som_codes=som_codes,hex=model_params$hex)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call create_umatrix\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  umatrix<-rs$data$umatrix
+  rm(rs)
+  invisible(gc(verbose=F))
+  ##Plot umatrix
+  rs<-plot_umatrix(umatrix=umatrix,som_pts=som_pts,som_cluster=som_cluster,wtdata_bmu=wtdata_bmu,model_params=model_params,plotly_umatrix=F,perps_umatrix=T,legend=T,big_fonts=F,axis_tittle=T,title=T)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call plot_umatrix\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  umatrix_plots[[which(h==horizon)]]<-rs$data$umatrix
+  umatrix_with_clusters[[which(h==horizon)]]<-rs$data$umatrix_with_clusters
+  rm(rs)
+  invisible(gc(verbose=F))
+  
+  ###### HEAT MAP ##########
+  if(exists('ot',inherits = F)&&!is.null(ot)&&any(!is.na(ot))&&!('ot' %in% names(trainData))){
+    trainData<-cbind(trainData,ot$ot)
+    colnames(trainData)[ncol(trainData)]<-'ot'
+  }
+  if(exists('alarm',inherits = F)&&!is.null(alarm)&&any(!is.na(alarm))&&!('alarm' %in% names(trainData))){
+    trainData<-cbind(trainData,alarm$alarm)
+    colnames(trainData)[ncol(trainData)]<-'alarm'
+  }
+  ##Heatmap variable
+  rs<-plot_heatmap_variable(wtdata=trainData,wtdata_bmu=wtdata_bmu,som_pts=som_pts,som_selected_rows=som_selected_rows,som_selected_columns=som_selected_columns,model_params=model_params,plotly=F,separate_turbines=F,legend=T,big_fonts=F,axis_tittle=T,grid_format=T,title=F,plot_sdv=T)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call plot_heatmap_variable\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  heatmap_variable_plots_mean[[which(h==horizon)]]<-rs$data$plots_mean
+  heatmap_variable_plots_sdv[[which(h==horizon)]]<-rs$data$plots_sdv
+  rm(rs)
+  invisible(gc(verbose=F))
+  
+  ### TO clean
+  to_rmv<-NULL
+  to_recover<-c('som_center_neuron_position','som_pts','som_codes','wtdata_bmu','dim','trainData','som_selected_rows','som_selected_columns','som_distances','alarm','alarm_block_code','alarm_all','alarm_all_block_code','ot','ot_all','ot_block_code','ot_all_block_code','date_time_name','filter_range_data','freq_dat_med_min')
+  for(re in to_recover){
+    if(exists(re,inherits = F)) to_rmv<-c(to_rmv,re)
+  }
+  rm(list=to_rmv)
+  invisible(gc(verbose=F))
+}
+close(con)
+rm(results)
+
+invisible(gc(verbose=F))
+cat("\nEnd prepare data.")
+```
+
+```{r index,echo=FALSE, message=FALSE,warning=FALSE, eval=TRUE,results='asis'}
+## Table of contents
+cat("# Index:\n\n")
+cat("1. [General Models Info](#general_info)\n\n")
+cat("2. [Umatrix 3D plot](#umatrix_3d_plot)\n\n")
+cat("3. [Clustering som codes plot](#clustered_som_codes)\n\n")
+cat("4. [Histogram variables clusters](#hist_var_clusters)\n\n")
+cat("5. [Heatmap variables](#heatmap_variables)\n\n")
+cat("6. [SOM codes importance](#som_codes_importance_container)\n\n")
+cat("7. [Plot the distance to BMU per turbine](#distance_bmu)\n\n")
+cat("8. [Plot distance to a common realtive neuron (mean)](#neuron_relative_distance)\n\n")
+cat("9. [Plot points over MAP of values n-sdv from relative common neuron](#neuron_relative_distance_points)\n\n")
+cat("10. [Plot the active BMU per turbine](#active_bmu)\n\n")
+cat("11. [Distance between turbines centroids](#distance_centroids)\n\n")
+cat("12. [Grouping of turbines 3,4,5 groups](#turbines_grouping)\n\n")
+```
+```{r input_vars,echo=FALSE, message=FALSE,warning=FALSE, eval=TRUE,results='asis'}
+cat("\n\n# 1 General Models Info<a name=\"general_info\"></a>\n\n")
+cat(paste0("\n\n### Date intervals:<a name=\"date_intervals\"></a>\n\n"),paste0("Train: ",as.POSIXct(min(trainData[,date_time_name],na.rm = T),tz=TZ,origin="1970-01-01")," -> ",as.POSIXct(max(trainData[,date_time_name],na.rm = T),tz=TZ,origin="1970-01-01")))
+cat(paste0("\n\n### Data frequency:<a name=\"general_data_freq\"></a>\n\n"),wt_query$seconds_to_aggregate[1]," seconds")
+cat(paste0("\n\n### Input Variables:<a name=\"general_input_vars\"></a>\n\n"),paste(colnames(trainData),collapse=", "))
+cat(paste0("\n\n### Model type:<a name=\"model_type\"></a>\n\n"),model_params$type)
+if(tolower(model_params$type) %in% c('gsom','hdgsom')){
+  cat(paste0("\n\n### Model type:<a name=\"model_type\"></a>\n\n"),model_params$type,"(",ifelse(model_params$hex,'hexagonal','square'),")"," with spreadfactor of:",model_params$spreadFactor)
+}else{
+  cat(paste0("\n\n### Model type:<a name=\"model_type\"></a>\n\n",model_params$type,"(",ifelse(model_params$hex,'hexagonal','square'),")"," of dimension:",model_params$dim," with alpha:",paste0(model_params$alpha,collapse = ',')))
+}
+cat(paste0("\n\n### Included turbines:<a name=\"included_turbines\"></a>\n\n",paste0(paste0(wt_query$ld_id,'(',wt_query$ld_code,')'),collapse = ', ')))
+#-----------------------------Selected Alarms-----------------------------------------------#
+if(exists("array_id_walm")&&!is.null(array_id_walm)&&!is.na(array_id_walm)&&(nchar(array_id_walm)>1)){
+  cat("\n\n### Selected Alarms:<a name=\"general_alarms\"></a>\n\n")
+  rs <- db_query(query=paste0("SELECT events_table_name FROM 1_cast_park_table_dic WHERE wp_code ='",wp_code,"'"),db_config=db_config)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call db_query\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  table_dic <- paste(rs$data$events_table_name[1],"dic", sep = "_")
+  stralarmas<-db_get_event_description(array_id_walm,table_dic,all_info=TRUE,target='alarm',db_config=db_config)
+  if(nrow(stralarmas)>0){
+    for(aa in 1:nrow(stralarmas)){
+      desc<-enc2utf8(stralarmas$descripcio_walm[aa])
+      cat(paste0("\n * __",stralarmas$id_walm[aa],"__ ",stralarmas$desc_stma[aa],"(",stralarmas$desc_substma[aa],") : ",desc,"\n"),sep="\n")
+    }
+  }
+  cat("\n")
+}
+#-----------------------------Selected Ots-----------------------------------------------#
+if(exists("array_ot")&&!is.null(array_ot)&&!is.na(array_ot)&&(nchar(array_ot)>1)){
+  cat("\n\n### Selected Ots:<a name=\"target_var\"></a>\n\n")
+  rs <- db_query(query=paste0("SELECT ot_table_name FROM 1_cast_park_table_dic WHERE wp_code ='",wp_code,"'"),db_config=db_config)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call db_query\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }
+  table_dic <- paste(rs$data$ot_table_name[1],"dic", sep = "_")
+  strots<-db_get_event_description(array_ot,table_dic,all_info=TRUE,target='ot',db_config=db_config)
+  if(nrow(strots)>0){
+    for(aa in 1:nrow(strots)){
+      desc<-enc2utf8(strots$descripcio_walm[aa])
+      cat(paste0("\n * __",strots$id_ot[aa],"__ : ",desc,"\n"),sep="\n")
+    }
+  }
+  cat("\n")
+}
+
+```
+
+```{r umatrix_plot,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+cat(paste0("\n\n# __2__ Umatrix 3D plot <a name=\"umatrix_3d_plot\"></a>\n"))
+for(i in 1:length(horizon)){
+  cat(paste0("\n\n### Horizon ",horizon[i],"\n"))
+  print(umatrix_plots[i])
+}
+cat(paste0("\n\n# __3__ Clustering som codes plot <a name=\"clustered_som_codes\"></a>\n"))
+for(i in 1:length(horizon)){
+  cat(paste0("\n\n### Horizon ",horizon[i],"\n"))
+  print(umatrix_with_clusters[i])
+}
+```
+
+```{r plot_histogram, fig.width=40,fig.height=30,out.width='8000px',out.height='4000px',echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+sink(stderr())
+cat('\n Plot histogram')
+sink()
+if(exists('ot',inherits = F)&&!is.null(ot)&&any(!is.na(ot))&&!('ot' %in% names(trainData))){
+  trainData<-cbind(trainData,ot$ot)
+  colnames(trainData)[ncol(trainData)]<-'ot'
+}
+if(exists('alarm',inherits = F)&&!is.null(alarm)&&any(!is.na(alarm))&&!('alarm' %in% names(trainData))){
+  trainData<-cbind(trainData,alarm$alarm)
+  colnames(trainData)[ncol(trainData)]<-'alarm'
+}
+rs<-plot_histogram_som_clusters(wtdata=trainData,som_cluster=som_cluster,som_pts=som_pts,wtdata_bmu=wtdata_bmu,som_selected_rows=som_selected_rows,som_selected_columns=som_selected_columns,date_time_name='date_time')
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call plot_histogram_som_clusters\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+
+cat(paste0("\n\n# __4__ Histogram variables clusters <a name=\"hist_var_clusters\"></a>\n Click to open in a new window\n"))
+cat("<div id=\"histogram_container\">")
+#clusters_histogram_plots
+print(rs$data$plot)
+cat("</div>")
+
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"histogram_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"histogram_container\").children[0].src;}, 0);})")
+cat("</script>")
+
+rm(rs)
+invisible(gc(verbose=F))
+```
+
+```{r plot_heatmap, fig.width=20,fig.height=14,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+cat(paste0("\n\n# __5__ Heatmap variables <a name=\"heatmap_variables\"></a>\n"))
+#cat(paste0("\n\n## __5.1__ Mean <a name=\"heatmap_variables_mean\"></a>\n Click to open in a new window\n"))
+for(i in 1:length(horizon)){
+  cat(paste0("\n\n### Horizon ",horizon[i],"\n"))
+  cat(paste0("\n\n## Mean\n Click to open in a new window\n"))
+  cat("<div id=\"heatmap_container_mean",i,"\">")
+  print(heatmap_variable_plots_mean[i])
+  cat("</div>")
+  cat("<script type=\"text/javascript\">")
+  cat("document.getElementById(\"heatmap_container_mean",i,"\").children[0].addEventListener(\"click\", function(){")
+  cat("var w = window.open('about:blank');")
+  cat("setTimeout(function(){")
+  cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"heatmap_container_mean",i,"\").children[0].src;}, 0);})")
+  cat("</script>")
+  
+  
+  cat(paste0("\n\n## Sdv expressed as % of original range\n Click to open in a new window\n"))
+  cat("<div id=\"heatmap_container_sdv",i,"\">")
+  print(heatmap_variable_plots_sdv[i])
+  cat("</div>")
+  cat("<script type=\"text/javascript\">")
+  cat("document.getElementById(\"heatmap_container_sdv",i,"\").children[0].addEventListener(\"click\", function(){")
+  cat("var w = window.open('about:blank');")
+  cat("setTimeout(function(){")
+  cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"heatmap_container_sdv",i,"\").children[0].src;}, 0);})")
+  cat("</script>")
+}
+```
+
+
+```{r som_codes_importance, fig.width=20,fig.height=20,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+sink(stderr())
+#cat('\n Plot variable importance neuron')
+sink()
+##Variable importance
+rs<-plot_som_codes_importance(som_codes=som_codes,som_pts=som_pts,som_selected_columns=som_selected_columns,plotly=F,legend=T,title=F)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call plot_som_codes_importance\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+cat(paste0("\n\n# __6__ SOM codes importance <a name=\"som_codes_importance\"></a>\n Click to open in a new window\n"))
+cat("<div id=\"som_codes_importance_container\">")
+rs$data$plot
+cat("</div>")
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"som_codes_importance_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"som_codes_importance_container\").children[0].src;}, 0);})")
+cat("</script>")
+rm(rs)
+invisible(gc(verbose=F))
+```
+
+
+```{r distances_bmu_turbines, fig.width=24,fig.height=17,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+sink(stderr())
+#cat('\n Plot distance bmu')
+sink()
+##Distances to bmu per turbine
+plots_distance_bmu_mvg_avg_days<-15
+rs<-plot_distance_bmu(wtdata=trainData,stat=stat,wtdata_bmu=wtdata_bmu,som_codes=som_codes,som_selected_columns=som_selected_columns,som_selected_rows=som_selected_rows,plotly=F,separate_turbines=F,legend=T,big_fonts=F,axis_tittle=T,grid_format=T,title=F,moving_avg_days=plots_distance_bmu_mvg_avg_days)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call plot_distance_bmu\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+
+cat(paste0("\n\n# __7__ Plot the distance to BMU per turbine <a name=\"distance_bmu\"></a>\n Click to open in a new window, moving average days:",plots_distance_bmu_mvg_avg_days,"\n"))
+cat("<div id=\"distance_container\">")
+rs$data$plot
+cat("</div>")
+
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"distance_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"distance_container\").children[0].src;}, 0);})")
+cat("</script>")
+rm(rs)
+invisible(gc(verbose=F))
+```
+
+```{r neuronchange_in_time,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+plotly=F
+if(!plotly){
+  opts_chunk$set(fig.width=40)
+  opts_chunk$set(fig.height=20)
+}
+interactive<-T
+
+sink(stderr())
+#cat('\n Plot neuron change in time')
+sink()
+## Clustering map
+nsdv<-6
+rs<-plot_neuron_change(wtdata_bmu=wtdata_bmu,wtdata=trainData[som_selected_rows,],som_pts=som_pts,som_codes=som_codes,model_params=model_params,seconds_to_aggregate=86400,plotly=plotly,use_median=F,interactive=interactive,nsdv=nsdv)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call plot_neuron_change\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+cat(paste0("\n\n# __8__ Plot distance to a common realtive neuron (mean) <a name=\"neuron_relative_distance\"></a>\n Click to open in a new window\n"))
+cat("<div id=\"neuron_relative_distance_container\">")
+rs$data$distance_plot
+cat("</div>")
+
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"neuron_relative_distance_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"neuron_relative_distance_container\").children[0].src;}, 0);})")
+cat("</script>")
+
+if(interactive) rs$data$interactive_plot
+
+cat(paste0("\n\n# __9__ Plot points over MAP of values ",nsdv,"sdv from realtive neuron <a name=\"neuron_relative_distance_points\"></a>\n Click to open in a new window\n"))
+cat("<div id=\"neuron_relative_distance_points_container\">")
+rs$data$umatrix_projection
+cat("</div>")
+
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"neuron_relative_distance_points_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"neuron_relative_distance_points_container\").children[0].src;}, 0);})")
+cat("</script>")
+rm(rs)
+invisible(gc(verbose=F))
+```
+
+
+```{r bmu_clustering, fig.width=40,fig.height=25,echo=FALSE, message=FALSE,warning=FALSE,results='asis'}
+sink(stderr())
+#cat('\n Plot bmu clustering')
+sink()
+## Clustering map
+nclusters<-NULL
+#nclusters<-5
+#Tmpfix
+clustering_method<-'hierarchical'
+rs<-create_bmu_clustering(nclusters,wtdata_bmu,trainData$ld_id[som_selected_rows],som_pts,verbose=F)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call create_bmu_clustering\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+clusters_xy<-rs$data$clusters_xy
+centroids<-rs$data$centroids
+clustering_method<-rs$data$clustering_method
+rm(rs)
+invisible(gc(verbose=F))
+tot<-sum(trainData$ld_id==trainData$ld_id[1])
+num_registers_threshold<-1
+if(model_params$hex){
+  per_register_threshold<-1
+  num_registers_threshold<-round((per_register_threshold*tot)/100,0)
+}
+per_register_threshold<-(num_registers_threshold*100)/tot
+
+rs<-plot_bmu_turbines(num_registers_threshold=num_registers_threshold,wtdata=trainData[som_selected_rows,],wtdata_bmu=wtdata_bmu,som_pts=som_pts,clusters_xy=clusters_xy,plotly=F,legend=F,big_fonts=F,axis_tittle=T,model_params=model_params,grid_format=T)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call plot_bmu_turbines\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+rm(list=c('clusters_xy','tot'))
+invisible(gc(verbose=F))
+cat(paste0("\n\n# __10__ Plot the active BMU per turbine <a name=\"active_bmu\"></a>\n Click to open in a new window, num registers needed to activate bmu:",num_registers_threshold,"(",round(per_register_threshold,3)," %)\n"))
+cat("<div id=\"active_bmu_container\">")
+rs$data$plots
+cat("</div>")
+
+cat("<script type=\"text/javascript\">")
+cat("document.getElementById(\"active_bmu_container\").children[0].addEventListener(\"click\", function(){")
+cat("var w = window.open('about:blank');")
+cat("setTimeout(function(){")
+cat("w.document.body.appendChild(w.document.createElement(\"img\")).src = document.getElementById(\"active_bmu_container\").children[0].src;}, 0);})")
+cat("</script>")
+rm(list=c('rs'))
+invisible(gc(verbose=F))
+```
+
+```{r distance_matrix,echo=FALSE, message=FALSE,warning=FALSE,results = 'asis'}
+sink(stderr())
+#cat('\n Table distance matrix and groups')
+sink()
+##Distance matrix and groups
+rs<-calcule_distance_matrix_turbines(centroids=centroids,use_simplex=T)
+if(rs$error){
+  output_msg <- paste0("\n Report rmd: on call calcule_distance_matrix_turbines\n",rs$msg)
+  close_protocol(output_msg, "Report rmd", debug_mode)
+  return(list(error=TRUE,data=NULL,msg=output_msg))
+}
+if(rs$warning){
+  cat(rs$msg)
+}else{
+  distance_matrix<-rs$data$distance_matrix
+  clusters_pairs<-rs$data$clusters_pairs
+  rm(rs)
+  invisible(gc(verbose=F))
+  cat(paste0("\n\n# __11__ Distance between turbines centroids <a name=\"distance_centroids\"></a>\n"))
+  knitr::kable(distance_matrix)
+}
+```
+
+```{r distance_matrix_groups,echo=FALSE, message=FALSE,warning=FALSE,results = 'asis'}
+cat(paste0("\n\n# __12__ Grouping of turbines 3,4,5 groups <a name=\"turbines_grouping\"></a>\n"))
+if(exists('distance_matrix',inherits = F)){
+  rs<-create_turbines_groups(wp_id=wt_query$wp_id[1],array_id_ot=wt_query$array_id_ot[1],distance_matrix=distance_matrix,number_of_groups=c(3,4,5),verbose=F,db_config=db_config)
+  if(rs$error){
+    output_msg <- paste0("\n Report rmd: on call create_turbines_groups\n",rs$msg)
+    close_protocol(output_msg, "Report rmd", debug_mode)
+    return(list(error=TRUE,data=NULL,msg=output_msg))
+  }else{
+    turbines_groups<-rs$data$groups
+    rm(rs)
+    invisible(gc(verbose=F))
+    knitr::kable(turbines_groups)
+  }
+}else{
+  cat('Unable to compute distance matrix')
+}
+
+```
