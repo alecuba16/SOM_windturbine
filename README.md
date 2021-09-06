@@ -1,0 +1,2 @@
+# SOM_windturbine
+A SOM (and HDGSOM) implementation for capturing the wind turbine's data behaviours in a graph. The generated report enables the detection of clusters of data that behaves in the same way. In this case, with the wind turbine dataset, you will be able to separate the turbine operational modes without human intervention. This is useful as a previous data pre-processing for any classification algorithm.
